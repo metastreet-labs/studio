@@ -4,7 +4,7 @@ import { IAppToolkit, APP_TOOLKIT } from '~app-toolkit/app-toolkit.interface';
 import { ContractFactory } from '~contract/contracts';
 import { Network } from '~types/network.interface';
 
-import { Pool__factory } from './ethers';
+import { Pool__factory, PoolLegacy__factory } from './ethers';
 
 // eslint-disable-next-line
 type ContractOpts = { address: string; network: Network };
@@ -18,6 +18,10 @@ export class MetastreetContractFactory extends ContractFactory {
   pool({ address, network }: ContractOpts) {
     return Pool__factory.connect(address, this.appToolkit.getNetworkProvider(network));
   }
+  poolLegacy({ address, network }: ContractOpts) {
+    return PoolLegacy__factory.connect(address, this.appToolkit.getNetworkProvider(network));
+  }
 }
 
 export type { Pool } from './ethers';
+export type { PoolLegacy } from './ethers';

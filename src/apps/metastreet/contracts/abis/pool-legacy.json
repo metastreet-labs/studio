@@ -1,0 +1,77 @@
+[
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "account",
+        "type": "address"
+      },
+      {
+        "internalType": "uint128",
+        "name": "tick",
+        "type": "uint128"
+      }
+    ],
+    "name": "deposits",
+    "outputs": [
+      {
+        "components": [
+          {
+            "internalType": "uint128",
+            "name": "shares",
+            "type": "uint128"
+          },
+          {
+            "internalType": "uint128",
+            "name": "redemptionPending",
+            "type": "uint128"
+          },
+          {
+            "internalType": "uint128",
+            "name": "redemptionIndex",
+            "type": "uint128"
+          },
+          {
+            "internalType": "uint128",
+            "name": "redemptionTarget",
+            "type": "uint128"
+          }
+        ],
+        "internalType": "struct Pool.Deposit",
+        "name": "",
+        "type": "tuple"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "account",
+        "type": "address"
+      },
+      {
+        "internalType": "uint128",
+        "name": "tick",
+        "type": "uint128"
+      }
+    ],
+    "name": "redemptionAvailable",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "shares",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  }
+]

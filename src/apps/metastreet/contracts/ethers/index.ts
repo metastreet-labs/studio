@@ -2,5 +2,7 @@
 /* tslint:disable */
 /* eslint-disable */
 export type { Pool } from './Pool';
+export type { PoolLegacy } from './PoolLegacy';
 export * as factories from './factories';
+export { PoolLegacy__factory } from './factories/PoolLegacy__factory';
 export { Pool__factory } from './factories/Pool__factory';

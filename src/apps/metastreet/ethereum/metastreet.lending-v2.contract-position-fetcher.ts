@@ -1,5 +1,5 @@
 import { Inject } from '@nestjs/common';
-import { BigNumberish, BigNumber, ethers } from 'ethers';
+import { BigNumberish, BigNumber, constants } from 'ethers';
 import { gql } from 'graphql-request';
 import { sumBy } from 'lodash';
 
@@ -21,12 +21,12 @@ import {
 import { ContractPositionBalance } from '~position/position-balance.interface';
 import { ContractPosition, MetaType } from '~position/position.interface';
 
-import { MetastreetContractFactory, Pool } from '../contracts';
-import { DefaultDataProps } from '~position/display.interface';
+import { MetastreetContractFactory, Pool, PoolLegacy } from '../contracts';
 
 export const GET_POOLS_QUERY = gql`
   {
     pools {
+      implementationVersionMajor
       id
       ticks {
         id
@@ -44,26 +44,6 @@ export const GET_POOLS_QUERY = gql`
     }
   }
 `;
-
-function getDepositsQuery(address: string, pool: string) {
-  return gql`
-    {
-      pool(id: "${pool}") {
-        deposits(where: { account: "${address}" }) {
-          shares
-          tick {
-            id
-            value
-            shares
-          }
-          redemptions {
-            shares
-          }
-        }
-      }
-    }
-  `;
-}
 
 function getAllDepositsQuery(address: string) {
   return gql`
@@ -88,6 +68,7 @@ function getAllDepositsQuery(address: string) {
 export type GetPoolsResponse = {
   pools: {
     id: string;
+    implementationVersionMajor: string;
     ticks: {
       id: string;
       limit: BigNumber;
@@ -116,25 +97,13 @@ export type GetAllDepositsResponse = {
   }[];
 };
 
-export type GetDepositsResponse = {
-  pool: {
-    deposits: {
-      shares: BigNumber;
-      tick: {
-        id: string;
-        shares: BigNumber;
-        value: BigNumber;
-      };
-      redemptions: {
-        shares: BigNumber;
-      }[];
-    }[];
-  };
-};
-
 export const SUBGRAPH_URL = 'https://api.thegraph.com/subgraphs/name/metastreet-labs/metastreet-v2-beta';
 
+/* Block number of the creation of pool factory */
+export const START_BLOCK_NUMBER = 17497132;
+
 export type ContractPositionDefinition = {
+  implementationVersionMajor: string;
   address: string;
   tickId: string;
   tick: BigNumber;
@@ -146,8 +115,24 @@ export type ContractPositionDefinition = {
 };
 
 export type DataProps = {
-  positionKey: string; // tick id
+  positionKey: string;
   tick: BigNumber; // encoded tick
+  implementationVersionMajor: string;
+};
+
+export type Deposited = {
+  amount: BigNumber;
+  shares: BigNumber;
+};
+
+export type Withdrawn = {
+  amount: BigNumber;
+  shares: BigNumber;
+};
+
+export type Redemption = {
+  amount: BigNumber;
+  shares: BigNumber;
 };
 
 @PositionTemplate()
@@ -165,6 +150,10 @@ export class EthereumMetastreetLendingV2ContractPositionFetcher extends Contract
     return this.metastreetContractFactory.pool({ address: _address, network: this.network });
   }
 
+  getLegacyContract(_address: string): PoolLegacy {
+    return this.metastreetContractFactory.poolLegacy({ address: _address, network: this.network });
+  }
+
   async getDefinitions(_params: GetDefinitionsParams): Promise<ContractPositionDefinition[]> {
     const data = await gqlFetch<GetPoolsResponse>({
       endpoint: SUBGRAPH_URL,
@@ -173,6 +162,7 @@ export class EthereumMetastreetLendingV2ContractPositionFetcher extends Contract
 
     return data.pools.flatMap(p => {
       return p.ticks.map(t => ({
+        implementationVersionMajor: p.implementationVersionMajor,
         address: p.id,
         tickId: t.id,
         tick: t.raw,
@@ -191,6 +181,11 @@ export class EthereumMetastreetLendingV2ContractPositionFetcher extends Contract
     const pool: Pool = _params.contract;
     return [
       {
+        metaType: MetaType.SUPPLIED,
+        address: await pool.currencyToken(),
+        network: this.network,
+      },
+      {
         metaType: MetaType.CLAIMABLE,
         address: await pool.currencyToken(),
         network: this.network,
@@ -200,8 +195,9 @@ export class EthereumMetastreetLendingV2ContractPositionFetcher extends Contract
 
   async getDataProps(_params: GetDataPropsParams<Pool, DataProps, ContractPositionDefinition>): Promise<DataProps> {
     return {
-      positionKey: `${_params.definition.tickId}`,
+      positionKey: _params.definition.tickId,
       tick: _params.definition.tick,
+      implementationVersionMajor: _params.definition.implementationVersionMajor,
     };
   }
 
@@ -223,7 +219,16 @@ export class EthereumMetastreetLendingV2ContractPositionFetcher extends Contract
     return `${labelPrefix}${duration} Day, ${rate}%, ${limit} ${currencyTokenSymbol}`;
   }
 
-  async getBalances(_address: string): Promise<ContractPositionBalance<DefaultDataProps>[]> {
+  async getPositionsForBalances() {
+    return this.appToolkit.getAppContractPositions<DataProps>({
+      appId: this.appId,
+      network: this.network,
+      groupIds: [this.groupId],
+    });
+  }
+
+  async getBalances(_address: string): Promise<ContractPositionBalance<DataProps>[]> {
+    const multicall = this.appToolkit.getMulticall(this.network);
     const address = await this.getAccountAddress(_address);
     if (address === ZERO_ADDRESS) return [];
 
@@ -233,25 +238,18 @@ export class EthereumMetastreetLendingV2ContractPositionFetcher extends Contract
       query: getAllDepositsQuery(address),
     });
 
-    /* tick id as key, balances as value */
-    const tickBalances = {};
+    /* Tick IDs */
+    const ticks = new Set();
 
-    /* compute account balance for each tick and add an entry to tickBalances */
+    /* Add active positions to the set of tick IDs */
     data.pools.forEach(p => {
       p.deposits.forEach(d => {
-        const tickShares = BigNumber.from(d.tick.shares);
-        const tickValue = BigNumber.from(d.tick.value);
-        const redeemedShares = BigNumber.from(
-          d.redemptions.reduce((partialSum, r) => partialSum.add(r.shares), ethers.constants.Zero),
-        );
-        const userShares = BigNumber.from(d.shares).add(redeemedShares);
-        const balance = tickShares.eq(ethers.constants.Zero)
-          ? ethers.constants.Zero
-          : tickValue.mul(userShares).div(tickShares);
-
-        /* only add an etnry if balance is non-zero */
-        if (balance.gt(ethers.constants.Zero)) {
-          tickBalances[d.tick.id] = [balance];
+        /* Only add a position if user shares is non-zero */
+        if (
+          !BigNumber.from(d.shares).eq(constants.Zero) ||
+          d.redemptions.some(r => !BigNumber.from(r.shares).eq(constants.Zero))
+        ) {
+          ticks.add(d.tick.id);
         }
       });
     });
@@ -259,20 +257,13 @@ export class EthereumMetastreetLendingV2ContractPositionFetcher extends Contract
     /* Get all positions from all pools */
     const contractPositions = await this.getPositionsForBalances();
 
-    /* Filter out positions based on account's tick balances */
-    const filteredPositions = contractPositions.reduce(
-      (positions: [ContractPosition, BigNumber][], cp: ContractPosition<DataProps>) => {
-        if (cp.dataProps.positionKey in tickBalances) {
-          positions.push([cp, tickBalances[cp.dataProps.positionKey]]);
-        }
-        return positions;
-      },
-      [],
-    );
+    /* Filter out positions based on account's active positions */
+    const filteredPositions = contractPositions.filter(cp => ticks.has(cp.dataProps.positionKey));
 
     const balances = await Promise.all(
-      filteredPositions.map(async contractPositionAndBalance => {
-        const [contractPosition, balancesRaw] = contractPositionAndBalance;
+      filteredPositions.map(async contractPosition => {
+        const contract = multicall.wrap(this.getContract(contractPosition.address));
+        const balancesRaw = await this.getTokenBalancesPerPosition({ address, contract, contractPosition, multicall });
         const allTokens = contractPosition.tokens.map((cp, idx) =>
           drillBalance(cp, balancesRaw[idx]?.toString() ?? '0', { isDebt: cp.metaType === MetaType.BORROWED }),
         );
@@ -288,24 +279,84 @@ export class EthereumMetastreetLendingV2ContractPositionFetcher extends Contract
   }
 
   async getTokenBalancesPerPosition(_params: GetTokenBalancesParams<Pool, DataProps>): Promise<BigNumberish[]> {
-    const data = await gqlFetch<GetDepositsResponse>({
-      endpoint: SUBGRAPH_URL,
-      query: getDepositsQuery(_params.address, _params.contractPosition.address),
-    });
-    let balance = ethers.constants.Zero;
-    data.pool.deposits.forEach(d => {
-      if (d.tick.id === _params.contractPosition.dataProps.positionKey) {
-        const tickShares = BigNumber.from(d.tick.shares);
-        const tickValue = BigNumber.from(d.tick.value);
-        const redeemedShares = BigNumber.from(
-          d.redemptions.reduce((partialSum, r) => partialSum.add(r.shares), ethers.constants.Zero),
-        );
-        const userShares = BigNumber.from(d.shares).add(redeemedShares);
-        balance = balance.add(
-          tickShares.eq(ethers.constants.Zero) ? ethers.constants.Zero : tickValue.mul(userShares).div(tickShares),
-        );
-      }
-    });
-    return [balance];
+    const contract: Pool = _params.contract;
+    const tick: BigNumber = _params.contractPosition.dataProps.tick;
+    const account: string = _params.address;
+    const implementationVersionMajor: string = _params.contractPosition.dataProps.implementationVersionMajor;
+
+    /* Get account's deposit logs and compute deposited amount and received shares */
+    const depositLogs = await contract.queryFilter(contract.filters.Deposited(account, tick), START_BLOCK_NUMBER);
+    const deposited: Deposited = depositLogs.reduce(
+      (deposited: Deposited, l) => {
+        if (l.args.tick.eq(tick) && l.args.account.toLowerCase() === account) {
+          return { amount: deposited.amount.add(l.args.amount), shares: deposited.shares.add(l.args.shares) };
+        } else {
+          return deposited;
+        }
+      },
+      { amount: constants.Zero, shares: constants.Zero },
+    );
+
+    /* Get account's withdrawal logs and compute withdrawn amount and burned shares */
+    let firstDepositBlockNumber: number = depositLogs.length > 0 ? depositLogs[0].blockNumber : START_BLOCK_NUMBER;
+    const withdrawLogs = await contract.queryFilter(contract.filters.Withdrawn(account, tick), firstDepositBlockNumber);
+    const withdrawn: Withdrawn = withdrawLogs.reduce(
+      (withdrawn: Withdrawn, l) => {
+        if (l.args.tick.eq(tick) && l.args.account.toLowerCase() === account) {
+          return { amount: withdrawn.amount.add(l.args.amount), shares: withdrawn.shares.add(l.args.shares) };
+        } else {
+          return withdrawn;
+        }
+      },
+      { amount: constants.Zero, shares: constants.Zero },
+    );
+
+    let redeemed: Redemption = { amount: constants.Zero, shares: constants.Zero };
+    /* Legacy implementation does not have latest deposits API */
+    if (implementationVersionMajor === '1') {
+      /* Get legacy pool interface */
+      const legacyPool = this.getLegacyContract(contract.address);
+
+      /* Get redemption available */
+      const redemptionAvailable = await legacyPool.redemptionAvailable(account, tick);
+      redeemed = { amount: redemptionAvailable.amount, shares: redemptionAvailable.shares };
+    } else {
+      /* Get redemption ID from account's deposit */
+      const deposit = await contract.deposits(account, tick);
+
+      /* Multicall redemption available and compute total amount and shares */
+      const redemptionIds = Array.from({ length: deposit.redemptionId.toNumber() }, (_, index) => index + 1);
+      const pool = _params.multicall.wrap(contract);
+      const redemptionsAvailable = await Promise.all(
+        redemptionIds.map(async id => await pool.redemptionAvailable(account, tick, BigNumber.from(id))),
+      );
+      redeemed = redemptionsAvailable.reduce(
+        (redemptionAvailable, { amount, shares }) => ({
+          amount: redemptionAvailable.amount.add(amount),
+          shares: redemptionAvailable.shares.add(shares),
+        }),
+        { amount: constants.Zero, shares: constants.Zero },
+      );
+    }
+
+    /* Compute active shares in tick */
+    const activeShares = deposited.shares.sub(redeemed.shares).sub(withdrawn.shares);
+
+    /* Compute current position balance from tick data in addition to redeemed amount available */
+    const tickData = await contract.liquidityNode(tick);
+    const currentPosition = tickData.shares.eq(constants.Zero)
+      ? redeemed.amount
+      : activeShares.mul(tickData.value).div(tickData.shares).add(redeemed.amount);
+
+    /* Compute deposit position (deposit shares * depositor's avg share price - withdrawn amount) */
+    const depositPosition = deposited.shares.mul(deposited.amount).div(deposited.shares).sub(withdrawn.amount);
+
+    /* Compute supplied and claimable balances */
+    const suppliedBalance = depositPosition.gt(currentPosition) ? currentPosition : depositPosition;
+    const claimableBalance = depositPosition.gt(currentPosition)
+      ? constants.Zero
+      : currentPosition.sub(depositPosition);
+
+    return [suppliedBalance, claimableBalance];
   }
 }
